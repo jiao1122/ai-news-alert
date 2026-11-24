@@ -294,7 +294,7 @@ def main():
         url = a.get("url", "").strip()
         send_bark(title, body, url)
 
-    if not alerts and (is_first_run or IS_MANUAL_RUN):
+    if not alerts and is_first_run:
         send_bark(
             "✅ AI情报监控已升级上线",
             f"本次巡逻了 {len(RSS_FEEDS)} 个中英文信息源（新增 {len(new_items)} 条），暂未发现新的重磅模型、羊毛或硬核实测，后续每30分钟自动监控！",
