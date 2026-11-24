@@ -50,11 +50,18 @@ def send_bark(title: str, body: str, url: str = ""):
         "title": title,
         "body": body,
         "group": "AI情报",
-        "isArchive": 1,
+                "isArchive": "1",
     }
-    if url:
+    if url and url.startswith("http"):
         payload["url"] = url
-    resp = requests.post(f"{base}/push", json=payload, timeout=15)
+    resp = requests.post(
+        f"{base}/push",
+        json=payload,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        print(f"Bark 返回异常: {resp.status_code} {resp.text}")
     resp.raise_for_status()
     print(f"已推送到 Bark: {title}")
 
