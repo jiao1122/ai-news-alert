@@ -1,0 +1,38 @@
+name: AI News Alert
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install requests feedparser
+
+      - name: 运行 AI 监控并推送
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          BARK_URL: ${{ secrets.BARK_URL }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python monitor.py
+
+      - name: 保存已读记录（防止重复推送）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen.json || true
+          git diff --staged --quiet || (git commit -m "chore: update seen items" && git push)
