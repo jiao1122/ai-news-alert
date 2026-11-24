@@ -2,7 +2,7 @@ import hashlib
 import json
 import os
 import re
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import feedparser
 import requests
@@ -12,19 +12,44 @@ BARK_URL = os.environ.get("BARK_URL", "").strip()
 IS_MANUAL_RUN = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 SEEN_FILE = "seen.json"
 
+
+def google_news_rss(query: str) -> str:
+    return (
+        f"https://news.google.com/rss/search?q={quote(query)}"
+        f"&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+    )
+
+
 RSS_FEEDS = [
+    # —— 大厂官方与海外一手 ——
     ("OpenAI官方", "https://openai.com/news/rss.xml"),
     ("Google AI", "https://blog.google/technology/ai/rss/"),
     ("DeepMind", "https://deepmind.google/blog/rss.xml"),
     ("HuggingFace", "https://huggingface.co/blog/feed.xml"),
     ("Simon Willison", "https://simonwillison.net/atom/everything/"),
-    ("HackerNews AI", "https://hnrss.org/newest?q=LLM+OR+OpenAI+OR+Gemini+OR+Claude+OR+DeepSeek+OR+Qwen+OR+free+API&points=20"),
-    ("Reddit LocalLLaMA", "https://www.reddit.com/r/LocalLLaMA/hot/.rss"),
+    (
+        "HackerNews AI",
+        "https://hnrss.org/newest?q=LLM+OR+Agent+OR+OpenAI+OR+Gemini+OR+Claude+OR+DeepSeek+OR+Qwen+OR+free+API&points=25",
+    ),
+    # —— 中文 AI 头部媒体、博主与技术社区（同步主流公众号内容） ——
+    ("量子位", "https://www.qbitai.com/feed"),
+    ("36氪", "https://36kr.com/feed-article"),
+    ("少数派", "https://sspai.com/feed"),
+    ("宝玉的分享", "https://baoyu.io/feed.xml"),
     ("V2EX技术", "https://www.v2ex.com/feed/tab/tech.xml"),
+    # —— 全网中文 24h 评测口碑 & 优惠羊毛监控 ——
+    (
+        "中文Agent实测",
+        google_news_rss("(AI Agent OR 智能体 OR 大模型) (实测 OR 评测 OR 体验 OR 对比 OR 吐槽) when:1d"),
+    ),
+    (
+        "中文AI羊毛优惠",
+        google_news_rss("(大模型 OR AI API OR DeepSeek OR Gemini OR ChatGPT OR Claude) (降价 OR 免费 OR 优惠 OR 限时免费) when:1d"),
+    ),
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; AIAlertBot/1.0; +https://github.com)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 }
 
 
@@ -50,7 +75,7 @@ def send_bark(title: str, body: str, url: str = ""):
         "title": title,
         "body": body,
         "group": "AI情报",
-                "isArchive": "1",
+        "isArchive": "1",
     }
     if url and url.startswith("http"):
         payload["url"] = url
@@ -80,37 +105,53 @@ def load_seen():
 
 
 def save_seen(seen_list):
-    # 只保留最近 1500 条记录，避免文件无限增大
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(seen_list[-1500:], f, ensure_ascii=False, indent=2)
+        json.dump(seen_list[-2000:], f, ensure_ascii=False, indent=2)
 
 
 def fetch_new_items(seen_set):
-    items = []
+    per_source = []
     for source_name, feed_url in RSS_FEEDS:
+        bucket = []
         try:
             resp = requests.get(feed_url, headers=HEADERS, timeout=15)
             resp.raise_for_status()
             parsed = feedparser.parse(resp.content)
-            for entry in parsed.entries[:12]:
+            for entry in parsed.entries[:8]:
                 title = (entry.get("title") or "").strip()
                 link = (entry.get("link") or "").strip()
                 summary = re.sub(r"<[^>]+>", " ", entry.get("summary") or "")
-                summary = re.sub(r"\s+", " ", summary).strip()[:280]
+                summary = re.sub(r"\s+", " ", summary).strip()[:260]
                 uid = item_id(link, title)
                 if not title or uid in seen_set:
                     continue
                 seen_set.add(uid)
-                items.append({
+                bucket.append({
                     "id": uid,
                     "source": source_name,
                     "title": title,
                     "summary": summary,
                     "url": link,
                 })
+            print(f"[抓取] {source_name}: 新增 {len(bucket)} 条")
         except Exception as e:
             print(f"[跳过] 抓取 {source_name} 失败: {e}")
-    return items
+        if bucket:
+            per_source.append(bucket)
+
+    # 各信息源轮流交叉排序，确保中英文来源都能被公平分析
+    interleaved = []
+    idx = 0
+    while True:
+        added = False
+        for bucket in per_source:
+            if idx < len(bucket):
+                interleaved.append(bucket[idx])
+                added = True
+        if not added:
+            break
+        idx += 1
+    return interleaved
 
 
 def discover_flash_models():
@@ -158,20 +199,22 @@ def discover_flash_models():
     return candidates
 
 
-def analyze_with_gemini(items, max_results=5):
-    prompt = f"""你是用户的私人 AI 情报筛选官。请阅读下面最新抓取的资讯列表，严格只挑出真正属于以下 3 类之一的高价值内容（最多挑 {max_results} 条）：
-1. "新模型"：知名大厂或重要开源团队发布的新 AI 模型、重大版本升级（如 OpenAI、Google Gemini、Anthropic Claude、DeepSeek、Qwen、Meta Llama、xAI Grok、字节/智谱/Kimi 等）。
-2. "优惠"：AI 会员、官方 API 降价、打折、限时促销活动。
-3. "薅羊毛"：真实可用的免费 API 额度、免费白嫖大额算力/会员福利、限时免费体验。
+def analyze_with_gemini(items, max_results=4):
+    prompt = f"""你是用户的私人 AI 情报筛选官。请阅读下面最新抓取的中英文资讯列表，严格只挑出真正属于以下 4 类之一的高价值内容（最多挑 {max_results} 条，宁缺毋滥）：
 
-严格过滤掉：普通技术讨论、观点文章、小众工具广告、融资八卦、非 AI 内容、已过期消息。如果列表中没有符合上述 3 类的高价值消息，必须返回空数组 []。
+1. "新模型"：知名大厂或重要开源团队发布的新 AI 模型、AI Agent 重大版本升级（如 OpenAI、Google Gemini、Anthropic Claude、DeepSeek、Qwen、Meta Llama、xAI Grok、字节/智谱/Kimi 等）。
+2. "优惠"：AI 会员、官方 API 降价、打折、限时促销活动。
+3. "薅羊毛"：真实可用的免费 API 额度、大额免费算力/会员白嫖福利、限时免费体验。
+4. "实测口碑"：针对热门 AI 模型或 AI Agent 的真实上手评测、横向优缺点对比、开发者深度吐槽或避坑经验（必须有实质干货，拒绝空洞吹水）。
+
+严格过滤掉：融资八卦、股价财报、普通行业新闻、软文推广、标题党鸡汤、与 AI 无关的资讯、基础概念科普、重复话题（同一事件只保留最精华的一条）。如果列表中没有符合上述高标准的消息，必须返回空数组 []。
 
 请只输出合法的 JSON 数组，每个元素格式如下：
 [
   {{
-    "category": "新模型" 或 "优惠" 或 "薅羊毛",
+    "category": "新模型" 或 "优惠" 或 "薅羊毛" 或 "实测口碑",
     "title": "简短中文标题（22字以内）",
-    "summary": "2-3句中文精华，说清发布内容/降价幅度/怎么白嫖（100字以内）",
+    "summary": "2-3句大白话中文精华：新模型讲清核心亮点，优惠/羊毛讲清怎么领，实测口碑讲清大家夸什么、吐槽什么（110字以内）",
     "url": "直接保留原链接"
   }}
 ]
@@ -189,7 +232,7 @@ def analyze_with_gemini(items, max_results=5):
     }
 
     last_err = None
-    for model in discover_flash_models()[:6]:
+    for model in discover_flash_models()[:8]:
         endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
             resp = requests.post(
@@ -229,15 +272,20 @@ def main():
     new_items = fetch_new_items(seen_set)
     print(f"本次新抓取 {len(new_items)} 条资讯（首次运行: {is_first_run}）")
 
-    # 首次运行最多精选 3 条，防止旧闻刷屏；平时每次最多处理最新 30 条
-    batch = new_items[:25] if is_first_run else new_items[:30]
-    max_push = 3 if is_first_run else 5
+    # 每次最多打包 50 条给 Gemini，单次最多推送 4 条防止刷屏
+    batch = new_items[:50]
+    max_push = 3 if is_first_run else 4
 
     alerts = []
     if batch:
         alerts = analyze_with_gemini(batch, max_results=max_push)
 
-    emoji_map = {"新模型": "🚀", "优惠": "💰", "薅羊毛": "🎁"}
+    emoji_map = {
+        "新模型": "🚀",
+        "优惠": "💰",
+        "薅羊毛": "🎁",
+        "实测口碑": "💬",
+    }
     for a in alerts:
         cat = a.get("category", "AI动态")
         icon = emoji_map.get(cat, "📢")
@@ -248,11 +296,10 @@ def main():
 
     if not alerts and (is_first_run or IS_MANUAL_RUN):
         send_bark(
-            "✅ AI情报监控已上线",
-            f"本次自动巡逻了 {len(RSS_FEEDS)} 个信息源（抓取 {len(new_items)} 条），暂未发现新的重磅模型发布或薅羊毛信息。后续将每30分钟自动监控！",
+            "✅ AI情报监控已升级上线",
+            f"本次巡逻了 {len(RSS_FEEDS)} 个中英文信息源（新增 {len(new_items)} 条），暂未发现新的重磅模型、羊毛或硬核实测，后续每30分钟自动监控！",
         )
 
-    # 保存所有已见过的 ID，防止下次重复推送
     for it in new_items:
         seen_list.append(it["id"])
     save_seen(seen_list)
