@@ -9,8 +9,8 @@ import requests
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 BARK_URL = os.environ.get("BARK_URL", "").strip()
-IS_MANUAL_RUN = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 SEEN_FILE = "seen.json"
+AIHOT_DAILY_URL = "https://aihot.news/feed/daily.xml"
 
 
 def google_news_rss(query: str) -> str:
@@ -31,7 +31,9 @@ RSS_FEEDS = [
         "HackerNews AI",
         "https://hnrss.org/newest?q=LLM+OR+Agent+OR+OpenAI+OR+Gemini+OR+Claude+OR+DeepSeek+OR+Qwen+OR+free+API&points=25",
     ),
-    # —— 中文 AI 头部媒体、博主与技术社区（同步主流公众号内容） ——
+    # —— AIHOT 精选（仅提取模型/Agent/羊毛，过滤股票等杂项） ——
+    ("AIHOT精选", "https://aihot.news/feed.xml"),
+    # —— 中文 AI 头部媒体、博主与技术社区 ——
     ("量子位", "https://www.qbitai.com/feed"),
     ("36氪", "https://36kr.com/feed-article"),
     ("少数派", "https://sspai.com/feed"),
@@ -53,6 +55,12 @@ HEADERS = {
 }
 
 
+def clean_html(raw: str, limit: int = 260) -> str:
+    text = re.sub(r"<[^>]+>", " ", raw or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
 def parse_bark(raw_value: str):
     match = re.search(r"https?://[^\s'\"]+", raw_value)
     if match:
@@ -68,13 +76,14 @@ def parse_bark(raw_value: str):
     return "https://api.day.app", key
 
 
-def send_bark(title: str, body: str, url: str = ""):
+def send_bark(title: str, body: str, url: str = "", group: str = "核心提醒", level: str = "active"):
     base, device_key = parse_bark(BARK_URL)
     payload = {
         "device_key": device_key,
         "title": title,
         "body": body,
-        "group": "AI情报",
+        "group": group,
+        "level": level,
         "isArchive": "1",
     }
     if url and url.startswith("http"):
@@ -88,7 +97,7 @@ def send_bark(title: str, body: str, url: str = ""):
     if resp.status_code != 200:
         print(f"Bark 返回异常: {resp.status_code} {resp.text}")
     resp.raise_for_status()
-    print(f"已推送到 Bark: {title}")
+    print(f"已推送到 Bark [{group}/{level}]: {title}")
 
 
 def item_id(url: str, title: str) -> str:
@@ -120,8 +129,7 @@ def fetch_new_items(seen_set):
             for entry in parsed.entries[:8]:
                 title = (entry.get("title") or "").strip()
                 link = (entry.get("link") or "").strip()
-                summary = re.sub(r"<[^>]+>", " ", entry.get("summary") or "")
-                summary = re.sub(r"\s+", " ", summary).strip()[:260]
+                summary = clean_html(entry.get("summary") or "", 260)
                 uid = item_id(link, title)
                 if not title or uid in seen_set:
                     continue
@@ -139,7 +147,6 @@ def fetch_new_items(seen_set):
         if bucket:
             per_source.append(bucket)
 
-    # 各信息源轮流交叉排序，确保中英文来源都能被公平分析
     interleaved = []
     idx = 0
     while True:
@@ -199,38 +206,14 @@ def discover_flash_models():
     return candidates
 
 
-def analyze_with_gemini(items, max_results=4):
-    prompt = f"""你是用户的私人 AI 情报筛选官。请阅读下面最新抓取的中英文资讯列表，严格只挑出真正属于以下 4 类之一的高价值内容（最多挑 {max_results} 条，宁缺毋滥）：
-
-1. "新模型"：知名大厂或重要开源团队发布的新 AI 模型、AI Agent 重大版本升级（如 OpenAI、Google Gemini、Anthropic Claude、DeepSeek、Qwen、Meta Llama、xAI Grok、字节/智谱/Kimi 等）。
-2. "优惠"：AI 会员、官方 API 降价、打折、限时促销活动。
-3. "薅羊毛"：真实可用的免费 API 额度、大额免费算力/会员白嫖福利、限时免费体验。
-4. "实测口碑"：针对热门 AI 模型或 AI Agent 的真实上手评测、横向优缺点对比、开发者深度吐槽或避坑经验（必须有实质干货，拒绝空洞吹水）。
-
-严格过滤掉：融资八卦、股价财报、普通行业新闻、软文推广、标题党鸡汤、与 AI 无关的资讯、基础概念科普、重复话题（同一事件只保留最精华的一条）。如果列表中没有符合上述高标准的消息，必须返回空数组 []。
-
-请只输出合法的 JSON 数组，每个元素格式如下：
-[
-  {{
-    "category": "新模型" 或 "优惠" 或 "薅羊毛" 或 "实测口碑",
-    "title": "简短中文标题（22字以内）",
-    "summary": "2-3句大白话中文精华：新模型讲清核心亮点，优惠/羊毛讲清怎么领，实测口碑讲清大家夸什么、吐槽什么（110字以内）",
-    "url": "直接保留原链接"
-  }}
-]
-
-待筛选资讯列表：
-{json.dumps(items, ensure_ascii=False)}
-"""
-
+def call_gemini(prompt: str, response_mime_type: str = "application/json") -> str:
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.2,
-            "responseMimeType": "application/json",
+            "responseMimeType": response_mime_type,
         },
     }
-
     last_err = None
     for model in discover_flash_models()[:8]:
         endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -250,16 +233,88 @@ def analyze_with_gemini(items, max_results=4):
                 continue
             data = resp.json()
             text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
-            result = json.loads(text)
-            if isinstance(result, list):
-                print(f"成功使用模型: {model}，筛选出 {len(result)} 条")
-                return result[:max_results]
+            print(f"成功使用模型: {model}")
+            return text
         except Exception as e:
             last_err = f"{model} -> {e}"
             print(f"[切换模型] {last_err}")
-
     raise RuntimeError(f"所有 Gemini 候选模型调用均失败，最后错误: {last_err}")
+
+
+def analyze_with_gemini(items, max_results=4):
+    prompt = f"""你是用户的私人 AI 情报筛选官。请阅读下面最新抓取的中英文资讯列表，严格只挑出真正属于以下 4 类之一的高价值内容（最多挑 {max_results} 条，宁缺毋滥）：
+
+1. "新模型"：知名大厂或重要开源团队发布的新 AI 模型、AI Agent 重大版本升级（如 OpenAI、Google Gemini、Anthropic Claude、DeepSeek、Qwen、Meta Llama、xAI Grok、字节/智谱/Kimi 等）。
+2. "优惠"：AI 会员、官方 API 降价、打折、限时促销活动。
+3. "薅羊毛"：真实可用的免费 API 额度、大额免费算力/会员白嫖福利、限时免费体验。
+4. "实测口碑"：针对热门 AI 模型或 AI Agent 的真实上手评测、横向优缺点对比、开发者深度吐槽或避坑经验（必须有实质干货，拒绝空洞吹水）。
+
+严格过滤掉：股票涨跌、公司财报、纯粹的融资八卦、普通行业新闻、硬件芯片股市消息、软文推广、标题党、与模型/Agent/优惠无关的内容、重复话题（同一事件只保留最精华的一条）。如果列表中没有符合上述高标准的消息，必须返回空数组 []。
+
+语言要求：用普通人也能秒懂的“大白话中文”总结，不要堆砌看不懂的专业黑话，直接讲清它是什么、好不好用、怎么白嫖或省钱。
+
+请只输出合法的 JSON 数组，每个元素格式如下：
+[
+  {{
+    "category": "新模型" 或 "优惠" 或 "薅羊毛" 或 "实测口碑",
+    "title": "简短中文标题（22字以内）",
+    "summary": "2-3句大白话中文精华（110字以内）",
+    "url": "直接保留原链接"
+  }}
+]
+
+待筛选资讯列表：
+{json.dumps(items, ensure_ascii=False)}
+"""
+    raw = call_gemini(prompt, response_mime_type="application/json")
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+    result = json.loads(raw)
+    return result[:max_results] if isinstance(result, list) else []
+
+
+def process_aihot_daily(seen_set, seen_list):
+    """把 AIHOT 每日日报单独静默归档到 Bark 的「AIHOT每日看」板块"""
+    try:
+        resp = requests.get(AIHOT_DAILY_URL, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        parsed = feedparser.parse(resp.content)
+        if not parsed.entries:
+            return
+        latest = parsed.entries[0]
+        title = (latest.get("title") or "AIHOT 每日简报").strip()
+        link = (latest.get("link") or "https://aihot.news").strip()
+        uid = item_id("aihot-daily:" + link, title)
+        if uid in seen_set:
+            return
+
+        content_list = latest.get("content") or []
+        raw_body = content_list[0].get("value", "") if content_list else ""
+        if not raw_body:
+            raw_body = latest.get("summary") or ""
+        plain_body = clean_html(raw_body, 2500)
+        if not plain_body:
+            return
+
+        prompt = f"""你是给普通小白用户翻译 AI 新闻的助手。下面是 AIHOT 最新一期日报原文。
+请你帮用户挑出里面最值得关心的 3～4 件事（只保留：新模型、好用的 Agent 工具、免费羊毛/降价或影响日常使用的趋势）。
+必须彻底删掉：股票行情、财报股价、纯粹的融资收购、看不懂的底层芯片商业消息。
+请用极简大白话输出 3～4 条编号要点，每条 1 句话说清「干嘛的 / 有啥用」，总字数不超过 220 字，不要输出多余开场白或 Markdown 符号。
+
+日报标题：{title}
+日报内容：{plain_body}
+"""
+        digest = call_gemini(prompt, response_mime_type="text/plain")
+        send_bark(
+            title=f"📰 {title}",
+            body=digest.strip(),
+            url=link,
+            group="AIHOT每日看",
+            level="passive",
+        )
+        seen_set.add(uid)
+        seen_list.append(uid)
+    except Exception as e:
+        print(f"[跳过] 处理 AIHOT 每日板块失败: {e}")
 
 
 def main():
@@ -269,16 +324,16 @@ def main():
     seen_list, is_first_run = load_seen()
     seen_set = set(seen_list)
 
+    # 1. 每天早上自动生成一条静默大白话板块「AIHOT每日看」
+    process_aihot_daily(seen_set, seen_list)
+
+    # 2. 正常巡逻抓取，只针对新模型/Agent/优惠/羊毛/实测响铃弹窗
     new_items = fetch_new_items(seen_set)
     print(f"本次新抓取 {len(new_items)} 条资讯（首次运行: {is_first_run}）")
 
-    # 每次最多打包 50 条给 Gemini，单次最多推送 4 条防止刷屏
     batch = new_items[:50]
     max_push = 3 if is_first_run else 4
-
-    alerts = []
-    if batch:
-        alerts = analyze_with_gemini(batch, max_results=max_push)
+    alerts = analyze_with_gemini(batch, max_results=max_push) if batch else []
 
     emoji_map = {
         "新模型": "🚀",
@@ -292,12 +347,14 @@ def main():
         title = f"{icon} [{cat}] {a.get('title', 'AI新动态')}"
         body = a.get("summary", "").strip() or "点击查看详情"
         url = a.get("url", "").strip()
-        send_bark(title, body, url)
+        send_bark(title, body, url, group="核心提醒", level="active")
 
     if not alerts and is_first_run:
         send_bark(
-            "✅ AI情报监控已升级上线",
-            f"本次巡逻了 {len(RSS_FEEDS)} 个中英文信息源（新增 {len(new_items)} 条），暂未发现新的重磅模型、羊毛或硬核实测，后续每30分钟自动监控！",
+            "✅ AI情报监控已上线",
+            f"本次巡逻了 {len(RSS_FEEDS)} 个信息源，后续将每30分钟自动监控。",
+            group="核心提醒",
+            level="active",
         )
 
     for it in new_items:
