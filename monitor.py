@@ -10,7 +10,6 @@ import requests
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 BARK_URL = os.environ.get("BARK_URL", "").strip()
 SEEN_FILE = "seen.json"
-AIHOT_DAILY_URL = "https://aihot.news/feed/daily.xml"
 
 
 def google_news_rss(query: str) -> str:
@@ -31,7 +30,7 @@ RSS_FEEDS = [
         "HackerNews AI",
         "https://hnrss.org/newest?q=LLM+OR+Agent+OR+OpenAI+OR+Gemini+OR+Claude+OR+DeepSeek+OR+Qwen+OR+free+API&points=25",
     ),
-    # —— AIHOT 精选（仅提取模型/Agent/羊毛，过滤股票等杂项） ——
+    # —— AIHOT 精选（只提取模型/Agent/优惠/羊毛，严滤股票杂项） ——
     ("AIHOT精选", "https://aihot.news/feed.xml"),
     # —— 中文 AI 头部媒体、博主与技术社区 ——
     ("量子位", "https://www.qbitai.com/feed"),
@@ -76,14 +75,13 @@ def parse_bark(raw_value: str):
     return "https://api.day.app", key
 
 
-def send_bark(title: str, body: str, url: str = "", group: str = "核心提醒", level: str = "active"):
+def send_bark(title: str, body: str, url: str = ""):
     base, device_key = parse_bark(BARK_URL)
     payload = {
         "device_key": device_key,
         "title": title,
         "body": body,
-        "group": group,
-        "level": level,
+        "group": "AI情报",
         "isArchive": "1",
     }
     if url and url.startswith("http"):
@@ -97,7 +95,7 @@ def send_bark(title: str, body: str, url: str = "", group: str = "核心提醒",
     if resp.status_code != 200:
         print(f"Bark 返回异常: {resp.status_code} {resp.text}")
     resp.raise_for_status()
-    print(f"已推送到 Bark [{group}/{level}]: {title}")
+    print(f"已推送到 Bark: {title}")
 
 
 def item_id(url: str, title: str) -> str:
@@ -206,41 +204,6 @@ def discover_flash_models():
     return candidates
 
 
-def call_gemini(prompt: str, response_mime_type: str = "application/json") -> str:
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "responseMimeType": response_mime_type,
-        },
-    }
-    last_err = None
-    for model in discover_flash_models()[:8]:
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        try:
-            resp = requests.post(
-                endpoint,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": GEMINI_API_KEY,
-                },
-                json=payload,
-                timeout=60,
-            )
-            if resp.status_code != 200:
-                last_err = f"{model} -> HTTP {resp.status_code}: {resp.text[:200]}"
-                print(f"[切换模型] {last_err}")
-                continue
-            data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            print(f"成功使用模型: {model}")
-            return text
-        except Exception as e:
-            last_err = f"{model} -> {e}"
-            print(f"[切换模型] {last_err}")
-    raise RuntimeError(f"所有 Gemini 候选模型调用均失败，最后错误: {last_err}")
-
-
 def analyze_with_gemini(items, max_results=4):
     prompt = f"""你是用户的私人 AI 情报筛选官。请阅读下面最新抓取的中英文资讯列表，严格只挑出真正属于以下 4 类之一的高价值内容（最多挑 {max_results} 条，宁缺毋滥）：
 
@@ -266,55 +229,44 @@ def analyze_with_gemini(items, max_results=4):
 待筛选资讯列表：
 {json.dumps(items, ensure_ascii=False)}
 """
-    raw = call_gemini(prompt, response_mime_type="application/json")
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
-    result = json.loads(raw)
-    return result[:max_results] if isinstance(result, list) else []
 
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
 
-def process_aihot_daily(seen_set, seen_list):
-    """把 AIHOT 每日日报单独静默归档到 Bark 的「AIHOT每日看」板块"""
-    try:
-        resp = requests.get(AIHOT_DAILY_URL, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        parsed = feedparser.parse(resp.content)
-        if not parsed.entries:
-            return
-        latest = parsed.entries[0]
-        title = (latest.get("title") or "AIHOT 每日简报").strip()
-        link = (latest.get("link") or "https://aihot.news").strip()
-        uid = item_id("aihot-daily:" + link, title)
-        if uid in seen_set:
-            return
+    last_err = None
+    for model in discover_flash_models()[:8]:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            resp = requests.post(
+                endpoint,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": GEMINI_API_KEY,
+                },
+                json=payload,
+                timeout=60,
+            )
+            if resp.status_code != 200:
+                last_err = f"{model} -> HTTP {resp.status_code}: {resp.text[:200]}"
+                print(f"[切换模型] {last_err}")
+                continue
+            data = resp.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
+            result = json.loads(text)
+            if isinstance(result, list):
+                print(f"成功使用模型: {model}，筛选出 {len(result)} 条")
+                return result[:max_results]
+        except Exception as e:
+            last_err = f"{model} -> {e}"
+            print(f"[切换模型] {last_err}")
 
-        content_list = latest.get("content") or []
-        raw_body = content_list[0].get("value", "") if content_list else ""
-        if not raw_body:
-            raw_body = latest.get("summary") or ""
-        plain_body = clean_html(raw_body, 2500)
-        if not plain_body:
-            return
-
-        prompt = f"""你是给普通小白用户翻译 AI 新闻的助手。下面是 AIHOT 最新一期日报原文。
-请你帮用户挑出里面最值得关心的 3～4 件事（只保留：新模型、好用的 Agent 工具、免费羊毛/降价或影响日常使用的趋势）。
-必须彻底删掉：股票行情、财报股价、纯粹的融资收购、看不懂的底层芯片商业消息。
-请用极简大白话输出 3～4 条编号要点，每条 1 句话说清「干嘛的 / 有啥用」，总字数不超过 220 字，不要输出多余开场白或 Markdown 符号。
-
-日报标题：{title}
-日报内容：{plain_body}
-"""
-        digest = call_gemini(prompt, response_mime_type="text/plain")
-        send_bark(
-            title=f"📰 {title}",
-            body=digest.strip(),
-            url=link,
-            group="AIHOT每日看",
-            level="passive",
-        )
-        seen_set.add(uid)
-        seen_list.append(uid)
-    except Exception as e:
-        print(f"[跳过] 处理 AIHOT 每日板块失败: {e}")
+    raise RuntimeError(f"所有 Gemini 候选模型调用均失败，最后错误: {last_err}")
 
 
 def main():
@@ -324,10 +276,6 @@ def main():
     seen_list, is_first_run = load_seen()
     seen_set = set(seen_list)
 
-    # 1. 每天早上自动生成一条静默大白话板块「AIHOT每日看」
-    process_aihot_daily(seen_set, seen_list)
-
-    # 2. 正常巡逻抓取，只针对新模型/Agent/优惠/羊毛/实测响铃弹窗
     new_items = fetch_new_items(seen_set)
     print(f"本次新抓取 {len(new_items)} 条资讯（首次运行: {is_first_run}）")
 
@@ -347,14 +295,12 @@ def main():
         title = f"{icon} [{cat}] {a.get('title', 'AI新动态')}"
         body = a.get("summary", "").strip() or "点击查看详情"
         url = a.get("url", "").strip()
-        send_bark(title, body, url, group="核心提醒", level="active")
+        send_bark(title, body, url)
 
     if not alerts and is_first_run:
         send_bark(
             "✅ AI情报监控已上线",
             f"本次巡逻了 {len(RSS_FEEDS)} 个信息源，后续将每30分钟自动监控。",
-            group="核心提醒",
-            level="active",
         )
 
     for it in new_items:
